@@ -1,4 +1,6 @@
 const KEY='traningslogg-v1';
+const API_URL='https://script.google.com/macros/s/AKfycbwF6OJaqVBoUfuPvssfnItJ9lW-po74bhcMQLQc5bwMdxpvplPbemMEUBhPfQapHg3zdQ/exec';
+const SYNC_KEY='traningslogg-sync-queue-v1';
 const seed={exercises:[
 {id:'pullups',name:'Pull-ups',type:'reps'},{id:'dips',name:'Dips',type:'reps'},{id:'pushups',name:'Armhävningar',type:'reps'},
 {id:'ttb',name:'Toes-to-bar',type:'reps'},{id:'legraises',name:'Leg raises',type:'reps'},{id:'bodysaw',name:'Body saw',type:'reps'}],
@@ -12,14 +14,46 @@ function render(v){if(v==='train')renderTrain();if(v==='history')renderHistory()
 function renderTrain(){let root=$('#train');root.innerHTML=`<div class='card'><label class='muted'>Pass</label><div class='row'><select id='tpl'>${db.templates.map(t=>`<option value='${t.id}'>${t.name}</option>`).join('')}</select><button id='start'>Starta</button></div></div><div id='workout'></div>`;$('#start').onclick=()=>startWorkout($('#tpl').value)}
 function startWorkout(tid){let t=db.templates.find(x=>x.id===tid);draft={templateId:tid,startedAt:new Date().toISOString(),results:t.exerciseIds.map(id=>({exerciseId:id,sets:Array(5).fill(null).map(()=>({reps:'',weight:'',seconds:''}))}))}; drawWorkout()}
 function drawWorkout(){let box=$('#workout');box.innerHTML=draft.results.map((r,ri)=>{let e=ex(r.exerciseId),prev=lastSets(e.id);return `<div class='card'><div class='exerciseHead'><div><h2>${e.name}</h2><div class='muted'>Förra: ${prev?prev.map(s=>formatSet(s,e.type)).join(' · '):'–'}</div></div></div>${r.sets.map((s,si)=>`<div class='set'><span>Set ${si+1}</span>${e.type==='time'?`<input inputmode='numeric' placeholder='sek' data-r='${ri}' data-s='${si}' data-k='seconds'>`:`<input inputmode='numeric' placeholder='reps' data-r='${ri}' data-s='${si}' data-k='reps'>${e.type==='weight_reps'?`<input inputmode='decimal' placeholder='kg' data-r='${ri}' data-s='${si}' data-k='weight'>`:''}`}</div>`).join('')}</div>`}).join('')+`<button id='saveWorkout' style='width:100%'>Spara pass</button>`;box.querySelectorAll('input').forEach(i=>i.oninput=()=>draft.results[+i.dataset.r].sets[+i.dataset.s][i.dataset.k]=i.value);$('#saveWorkout').onclick=finishWorkout}
-function finishWorkout(){draft.results.forEach(r=>r.sets=r.sets.filter(s=>s.reps!==''||s.weight!==''||s.seconds!==''));db.sessions.push({...draft,finishedAt:new Date().toISOString()});save();draft={};alert('Passet är sparat.');renderTrain()}
+async function finishWorkout(){
+  draft.results.forEach(r=>r.sets=r.sets.filter(s=>s.reps!==''||s.weight!==''||s.seconds!==''));
+  const session={...draft,finishedAt:new Date().toISOString()};
+  db.sessions.push(session); save();
+  const payload=makeSyncPayload(session);
+  draft={}; renderTrain();
+  const synced=await syncPayload(payload);
+  alert(synced?'Passet är sparat och skickat till Google Sheets.':'Passet är sparat lokalt. Google Sheets-synk väntar tills du är online.');
+}
+function makeSyncPayload(session){
+  const template=db.templates.find(t=>t.id===session.templateId);
+  return {action:'saveWorkout',date:session.finishedAt,workoutName:template?.name||'',exercises:session.results.map(r=>({name:ex(r.exerciseId)?.name||'',sets:r.sets.map(s=>({reps:s.reps===''?'':Number(s.reps),weight:s.weight===''?'':Number(s.weight),time:s.seconds===''?'':Number(s.seconds)}))}))};
+}
+function getQueue(){try{return JSON.parse(localStorage.getItem(SYNC_KEY)||'[]')}catch{return []}}
+function setQueue(q){localStorage.setItem(SYNC_KEY,JSON.stringify(q))}
+async function sendToSheets(payload){
+  if(!navigator.onLine)return false;
+  try{
+    await fetch(API_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(payload)});
+    return true;
+  }catch{return false}
+}
+async function syncPayload(payload){
+  const q=getQueue(); q.push(payload); setQueue(q);
+  return flushSyncQueue();
+}
+async function flushSyncQueue(){
+  const q=getQueue(); if(!q.length)return true;
+  const remaining=[];
+  for(const item of q){if(!(await sendToSheets(item)))remaining.push(item)}
+  setQueue(remaining); return remaining.length===0;
+}
+window.addEventListener('online',()=>flushSyncQueue());
 function formatSet(s,type){if(type==='time')return `${s.seconds}s`;if(type==='weight_reps')return `${s.reps}×${s.weight||0}kg`;return s.reps||'–'}
 function metric(r){let e=ex(r.exerciseId);if(e.type==='time')return r.sets.reduce((a,s)=>a+(+s.seconds||0),0);if(e.type==='weight_reps')return r.sets.reduce((a,s)=>a+(+s.reps||0)*(+s.weight||0),0);return r.sets.reduce((a,s)=>a+(+s.reps||0),0)}
 function renderHistory(){let root=$('#history');root.innerHTML=`<div class='card'><label class='muted'>Övning</label><select id='hex'><option value=''>Alla pass</option>${db.exercises.map(e=>`<option value='${e.id}'>${e.name}</option>`).join('')}</select></div><div id='hist'></div>`;$('#hex').onchange=drawHistory;drawHistory()}
 function drawHistory(){let id=$('#hex').value,out=[];[...db.sessions].reverse().forEach(s=>s.results.filter(r=>!id||r.exerciseId===id).forEach(r=>out.push(`<div class='card'><div class='row'><div class='grow'><b>${ex(r.exerciseId)?.name||'Övning'}</b><div class='muted'>${new Date(s.finishedAt).toLocaleDateString('sv-SE')}</div></div><div class='big'>${metric(r)}</div></div><div class='muted'>${r.sets.map(x=>formatSet(x,ex(r.exerciseId)?.type)).join(' · ')}</div></div>`)));$('#hist').innerHTML=out.join('')||`<div class='card muted'>Ingen historik ännu.</div>`}
-function renderSettings(){let root=$('#settings');root.innerHTML=`<div class='card'><h2>Övningar</h2><div id='exlist'>${db.exercises.map(e=>`<div class='row' style='margin:8px 0'><span class='grow'>${e.name}</span><span class='pill'>${e.type==='reps'?'reps':e.type==='weight_reps'?'vikt + reps':'tid'}</span></div>`).join('')}</div><div class='row'><input id='newName' placeholder='Ny övning'><select id='newType'><option value='reps'>Reps</option><option value='weight_reps'>Vikt + reps</option><option value='time'>Tid</option></select><button id='addEx'>+</button></div></div><div class='card'><h2>Passmallar</h2>${db.templates.map(t=>`<div style='margin:12px 0'><b>${t.name}</b><div class='muted'>${t.exerciseIds.map(id=>ex(id)?.name).join(' · ')}</div><button class='secondary editTpl' data-id='${t.id}' style='margin-top:6px'>Redigera</button></div>`).join('')}<button id='newTpl' class='secondary'>+ Ny passmall</button></div><div class='card'><h2>Data</h2><div class='row'><button id='export' class='secondary'>Exportera JSON</button><label class='secondary' style='padding:12px 14px;border-radius:12px;font-weight:650'>Importera<input id='import' type='file' accept='.json' hidden></label></div><p class='muted'>Google Sheets-synk kopplas på i nästa steg.</p></div>`;$('#addEx').onclick=addExercise;document.querySelectorAll('.editTpl').forEach(b=>b.onclick=()=>editTemplate(b.dataset.id));$('#newTpl').onclick=()=>editTemplate(null);$('#export').onclick=exportData;$('#import').onchange=importData}
+function renderSettings(){let root=$('#settings');root.innerHTML=`<div class='card'><h2>Övningar</h2><div id='exlist'>${db.exercises.map(e=>`<div class='row' style='margin:8px 0'><span class='grow'>${e.name}</span><span class='pill'>${e.type==='reps'?'reps':e.type==='weight_reps'?'vikt + reps':'tid'}</span></div>`).join('')}</div><div class='row'><input id='newName' placeholder='Ny övning'><select id='newType'><option value='reps'>Reps</option><option value='weight_reps'>Vikt + reps</option><option value='time'>Tid</option></select><button id='addEx'>+</button></div></div><div class='card'><h2>Passmallar</h2>${db.templates.map(t=>`<div style='margin:12px 0'><b>${t.name}</b><div class='muted'>${t.exerciseIds.map(id=>ex(id)?.name).join(' · ')}</div><button class='secondary editTpl' data-id='${t.id}' style='margin-top:6px'>Redigera</button></div>`).join('')}<button id='newTpl' class='secondary'>+ Ny passmall</button></div><div class='card'><h2>Data</h2><div class='row'><button id='export' class='secondary'>Exportera JSON</button><label class='secondary' style='padding:12px 14px;border-radius:12px;font-weight:650'>Importera<input id='import' type='file' accept='.json' hidden></label></div><p class='muted'>Google Sheets-synk är aktiverad. Pass sparas alltid lokalt och skickas även till kalkylarket när du är online.</p><button id='syncNow' class='secondary'>Synka nu</button></div>`;$('#addEx').onclick=addExercise;document.querySelectorAll('.editTpl').forEach(b=>b.onclick=()=>editTemplate(b.dataset.id));$('#newTpl').onclick=()=>editTemplate(null);$('#export').onclick=exportData;$('#import').onchange=importData;$('#syncNow').onclick=async()=>alert(await flushSyncQueue()?'Synkningen är klar.':'Kunde inte synka just nu.')}
 function addExercise(){let n=$('#newName').value.trim();if(!n)return;db.exercises.push({id:'e'+Date.now(),name:n,type:$('#newType').value});save();renderSettings()}
 function editTemplate(id){let t=id?db.templates.find(x=>x.id===id):{id:'t'+Date.now(),name:'Nytt pass',exerciseIds:[]};let name=prompt('Namn på passet:',t.name);if(!name)return;let chosen=prompt('Skriv övningarnas nummer i ordning, separerade med kommatecken:\n'+db.exercises.map((e,i)=>`${i+1}. ${e.name}`).join('\n'),t.exerciseIds.map(x=>db.exercises.findIndex(e=>e.id===x)+1).join(','));if(chosen===null)return;t.name=name;t.exerciseIds=chosen.split(',').map(x=>db.exercises[+x.trim()-1]?.id).filter(Boolean);if(!id)db.templates.push(t);save();renderSettings()}
 function exportData(){let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(db,null,2)],{type:'application/json'}));a.download='traningslogg.json';a.click()}
 function importData(ev){let f=ev.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{try{db=JSON.parse(r.result);save();renderSettings()}catch{alert('Filen kunde inte läsas.')}};r.readAsText(f)}
-render('train'); if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+render('train'); flushSyncQueue(); if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
